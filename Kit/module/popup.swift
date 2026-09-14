@@ -79,6 +79,7 @@ open class PopupWrapper: NSStackView, Popup_p {
 
 public class PopupWindow: NSPanel, NSWindowDelegate {
     private let viewController: PopupViewController
+    private weak var anchorView: NSView?
     internal var locked: Bool = false
     internal var openedBy: widget_t? = nil
     
@@ -112,8 +113,60 @@ public class PopupWindow: NSPanel, NSWindowDelegate {
         self.collectionBehavior = .moveToActiveSpace
         self.backgroundColor = .clear
         self.hasShadow = true
+        self.acceptsMouseMovedEvents = true
         self.setIsVisible(false)
         self.delegate = self
+    }
+
+    public override func setIsVisible(_ flag: Bool) {
+        if !flag {
+            self.childWindows?.compactMap { $0 as? PopupWindow }.forEach { $0.setIsVisible(false) }
+            if let parent = self.parent as? PopupWindow {
+                parent.removeChildWindow(self)
+            }
+            self.anchorView = nil
+        }
+        super.setIsVisible(flag)
+    }
+
+    public func show(beside anchor: NSView) {
+        guard let parent = anchor.window as? PopupWindow, parent.isVisible else { return }
+        self.anchorView = anchor
+        self.openedBy = nil
+        if self.parent !== parent {
+            self.parent?.removeChildWindow(self)
+            parent.addChildWindow(self, ordered: .above)
+        }
+        self.positionBesideAnchor()
+        self.setIsVisible(true)
+        self.positionBesideAnchor()
+    }
+
+    public func positionBesideAnchor() {
+        guard let anchor = self.anchorView, let parent = anchor.window,
+              let screen = parent.screen ?? NSScreen.main else { return }
+        let rect = parent.convertToScreen(anchor.convert(anchor.bounds.intersection(anchor.visibleRect), to: nil))
+        self.setFrameOrigin(Self.frame(beside: rect, parent: parent.frame, size: self.frame.size, screen: screen.visibleFrame).origin)
+    }
+
+    internal static func frame(beside anchor: NSRect, parent: NSRect, size: NSSize, screen: NSRect) -> NSRect {
+        let gap: CGFloat = 6
+        let left = parent.minX - size.width - gap
+        let right = parent.maxX + gap
+        let fitsLeft = left >= screen.minX
+        let fitsRight = right + size.width <= screen.maxX
+        let moreSpaceOnLeft = parent.minX - screen.minX >= screen.maxX - parent.maxX
+        let x = fitsLeft || (!fitsRight && moreSpaceOnLeft) ? left : right
+        return NSRect(
+            x: max(screen.minX, min(x, screen.maxX - size.width)),
+            y: max(screen.minY, min(anchor.maxY - size.height, screen.maxY - size.height)),
+            width: size.width,
+            height: size.height
+        )
+    }
+
+    public func windowDidResize(_ notification: Notification) {
+        self.positionBesideAnchor()
     }
     
     public func windowWillMove(_ notification: Notification) {
@@ -123,6 +176,19 @@ public class PopupWindow: NSPanel, NSWindowDelegate {
     
     public func windowDidResignKey(_ notification: Notification) {
         if self.locked {
+            return
+        }
+
+        if self.parent is PopupWindow || self.childWindows?.contains(where: { $0 is PopupWindow }) == true {
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, self.isVisible, !self.locked else { return }
+                let root = self.parent as? PopupWindow ?? self
+                let keyWindow = NSApp.keyWindow
+                if NSApp.isActive && (keyWindow === root || keyWindow?.parent === root) {
+                    return
+                }
+                root.setIsVisible(false)
+            }
             return
         }
         
@@ -182,6 +248,7 @@ internal class PopupViewController: NSViewController {
 
 internal class PopupView: NSView {
     private var view: Popup_p? = nil
+    private var screenFrame: NSRect? { (self.window?.screen ?? NSScreen.main)?.visibleFrame }
     
     private var foreground: NSVisualEffectView
     private var background: NSView
@@ -255,13 +322,13 @@ internal class PopupView: NSView {
             height: (view?.frame.height ?? 0) + Constants.Popup.headerHeight + (Constants.Popup.margins*2)
         )
         
-        self.windowHeight = NSScreen.main?.visibleFrame.height // for height recalculate when appear/disappear
+        self.windowHeight = self.screenFrame?.height // for height recalculate when appear/disappear
         self.containerHeight = self.body.documentView?.frame.height // for scroll diff calculation
-        if let screenHeight = NSScreen.main?.visibleFrame.height, size.height > screenHeight {
+        if let screenHeight = self.screenFrame?.height, size.height > screenHeight {
             size.height = screenHeight - Constants.Widget.height
             isScrollVisible = true
         }
-        if let screenWidth = NSScreen.main?.visibleFrame.width, size.width > screenWidth {
+        if let screenWidth = self.screenFrame?.width, size.width > screenWidth {
             size.width = screenWidth
         }
         
@@ -293,7 +360,7 @@ internal class PopupView: NSView {
         self.display()
         self.body.subviews.first?.display()
         
-        if let screenHeight = NSScreen.main?.visibleFrame.height, let size = self.body.documentView?.frame.size {
+        if let screenHeight = self.screenFrame?.height, let size = self.body.documentView?.frame.size {
             if screenHeight != self.windowHeight {
                 self.recalculateHeight(size)
             }
@@ -316,13 +383,13 @@ internal class PopupView: NSView {
         )
         let h0 = self.containerHeight ?? 0
         
-        self.windowHeight = NSScreen.main?.visibleFrame.height // for height recalculate when appear/disappear
+        self.windowHeight = self.screenFrame?.height // for height recalculate when appear/disappear
         self.containerHeight = self.body.documentView?.frame.height // for scroll diff calculation
-        if let screenHeight = NSScreen.main?.visibleFrame.height, windowSize.height > screenHeight {
+        if let screenHeight = self.screenFrame?.height, windowSize.height > screenHeight {
             windowSize.height = screenHeight - Constants.Widget.height
             isScrollVisible = true
         }
-        if let screenWidth = NSScreen.main?.visibleFrame.width, windowSize.width > screenWidth {
+        if let screenWidth = self.screenFrame?.width, windowSize.width > screenWidth {
             windowSize.width = screenWidth
         }
         
