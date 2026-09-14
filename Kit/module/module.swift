@@ -269,6 +269,12 @@ open class Module {
             }
         }
     }
+
+    public func showPopup(beside anchor: NSView) -> PopupWindow? {
+        guard self.enabled, self.popupView != nil, let popup = self.popup else { return nil }
+        popup.show(beside: anchor)
+        return popup
+    }
     
     @objc private func listenForWindowOpen(_ notification: Notification) {
         guard var state = notification.userInfo?["state"] as? Bool else { return }

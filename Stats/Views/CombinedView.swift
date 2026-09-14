@@ -49,7 +49,7 @@ internal class CombinedView: NSObject, NSGestureRecognizerDelegate {
             }
         }
         
-        self.popup = PopupWindow(title: "Combined modules", module: .combined, view: Popup()) { _ in }
+        self.popup = PopupWindow(title: "Combined modules", module: .combined, view: CombinedPopup(modules)) { _ in }
         
         if self.status {
             self.enable()
@@ -57,11 +57,13 @@ internal class CombinedView: NSObject, NSGestureRecognizerDelegate {
         
         NotificationCenter.default.addObserver(self, selector: #selector(listenForOneView), name: .toggleOneView, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(listenForModuleRearrrange), name: .moduleRearrange, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(closePopup), name: .combinedModulesPopup, object: nil)
     }
     
     deinit {
         NotificationCenter.default.removeObserver(self, name: .toggleOneView, object: nil)
         NotificationCenter.default.removeObserver(self, name: .moduleRearrange, object: nil)
+        NotificationCenter.default.removeObserver(self, name: .combinedModulesPopup, object: nil)
     }
     
     public func enable() {
@@ -83,6 +85,7 @@ internal class CombinedView: NSObject, NSGestureRecognizerDelegate {
     }
     
     public func disable() {
+        self.closePopup()
         if let item = self.menuBarItem {
             NSStatusBar.system.removeStatusItem(item)
         }
@@ -110,8 +113,9 @@ internal class CombinedView: NSObject, NSGestureRecognizerDelegate {
         self.menuBarItem?.length = w
     }
     
-    // call when popup appear/disappear
-    private func visibilityCallback(_ state: Bool) {}
+    @objc private func closePopup() {
+        self.popup?.setIsVisible(false)
+    }
     
     @objc private func handleClick() {
         if self.combinedModulesPopup {
@@ -208,11 +212,22 @@ private class SeparatorLineView: NSView {
     }
 }
 
-private class Popup: NSStackView, Popup_p {
-    fileprivate var keyboardShortcut: [UInt16] = []
-    fileprivate var sizeCallback: ((NSSize) -> Void)? = nil
+internal class CombinedPopup: NSStackView, Popup_p {
+    var keyboardShortcut: [UInt16] = []
+    var sizeCallback: ((NSSize) -> Void)? = nil
+    private let modules: [Module]
+    private var mouseLocation: NSPoint = .zero
+    private var displayedModules: [Module] = []
+    private var activeModule: Module?
+    private var detailPopup: PopupWindow?
+    private var pendingModule: Module?
+    private var showWorkItem: DispatchWorkItem?
+    private var hideWorkItem: DispatchWorkItem?
+    private var localMonitor: Any?
+    private var globalMonitor: Any?
     
-    init() {
+    init(_ modules: [Module]) {
+        self.modules = modules
         self.keyboardShortcut = Store.shared.array(key: "CombinedModules_popup_keyboardShortcut", defaultValue: []) as? [UInt16] ?? []
         
         super.init(frame: NSRect(x: 0, y: 0, width: Constants.Popup.width, height: 0))
@@ -225,6 +240,9 @@ private class Popup: NSStackView, Popup_p {
         self.reinit()
         
         NotificationCenter.default.addObserver(self, selector: #selector(reinit), name: .toggleModule, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(reinit), name: .moduleRearrange, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(close), name: NSApplication.didResignActiveNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(close), name: .togglePopup, object: nil)
     }
     
     required init?(coder: NSCoder) {
@@ -232,21 +250,147 @@ private class Popup: NSStackView, Popup_p {
     }
     
     deinit {
-        NotificationCenter.default.removeObserver(self, name: .toggleOneView, object: nil)
+        self.stopMonitoring()
+        NotificationCenter.default.removeObserver(self)
     }
     
-    fileprivate func settings() -> NSView? { return nil }
-    fileprivate func appear() {}
-    fileprivate func disappear() {}
-    fileprivate func setKeyboardShortcut(_ binding: [UInt16]) {
+    func settings() -> NSView? { return nil }
+    func appear() {
+        self.stopMonitoring()
+        self.localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .scrollWheel, .leftMouseDown, .rightMouseDown, .keyDown]) { [weak self] event in
+            guard let self = self else { return event }
+            let point = event.window?.convertPoint(toScreen: event.locationInWindow) ?? NSEvent.mouseLocation
+            if event.type == .keyDown {
+                if event.keyCode == 53 {
+                    self.close()
+                    return nil
+                }
+            } else if event.type == .leftMouseDown || event.type == .rightMouseDown {
+                if !self.containsMouse(at: point) { self.close() }
+            } else {
+                DispatchQueue.main.async { [weak self] in self?.updateHover(at: point) }
+            }
+            return event
+        }
+        self.globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown, .rightMouseDown]) { [weak self] event in
+            if event.type == .mouseMoved {
+                self?.updateHover(at: NSEvent.mouseLocation)
+            } else {
+                self?.close()
+            }
+        }
+        DispatchQueue.main.async { [weak self] in self?.updateHover(at: NSEvent.mouseLocation) }
+    }
+
+    func disappear() {
+        self.stopMonitoring()
+        self.hideDetails()
+    }
+
+    private func stopMonitoring() {
+        if let monitor = self.localMonitor { NSEvent.removeMonitor(monitor) }
+        if let monitor = self.globalMonitor { NSEvent.removeMonitor(monitor) }
+        self.localMonitor = nil
+        self.globalMonitor = nil
+        self.cancelPendingShow()
+        self.hideWorkItem?.cancel()
+        self.hideWorkItem = nil
+    }
+
+    private func containsMouse(at point: NSPoint) -> Bool {
+        return self.window?.frame.contains(point) == true || self.detailPopup?.frame.contains(point) == true
+    }
+
+    private func moduleUnderMouse() -> Module? {
+        guard let window = self.window, window.isVisible, window.frame.contains(self.mouseLocation) else { return nil }
+        self.layoutSubtreeIfNeeded()
+        return self.displayedModules.first { module in
+            guard let portal = module.portal else { return false }
+            let rect = portal.bounds.intersection(portal.visibleRect)
+            return !rect.isEmpty && window.convertToScreen(portal.convert(rect, to: nil)).contains(self.mouseLocation)
+        }
+    }
+
+    private func updateHover(at point: NSPoint) {
+        self.mouseLocation = point
+        guard self.window?.isVisible == true else { return }
+        if let popup = self.detailPopup, popup.isVisible, popup.frame.contains(point) {
+            self.cancelPendingShow()
+            self.hideWorkItem?.cancel()
+            self.hideWorkItem = nil
+            return
+        }
+        if let module = self.moduleUnderMouse() {
+            self.hideWorkItem?.cancel()
+            self.hideWorkItem = nil
+            if module === self.activeModule, self.detailPopup?.isVisible == true {
+                self.cancelPendingShow()
+                self.detailPopup?.positionBesideAnchor()
+                return
+            }
+            guard module !== self.pendingModule else { return }
+            self.cancelPendingShow()
+            self.pendingModule = module
+            let work = DispatchWorkItem { [weak self] in
+                guard let self = self, self.moduleUnderMouse() === module, let portal = module.portal else { return }
+                self.hideDetails()
+                self.detailPopup = module.showPopup(beside: portal)
+                if self.detailPopup != nil {
+                    self.activeModule = module
+                    portal.wantsLayer = true
+                    portal.layer?.cornerRadius = 6
+                    portal.layer?.borderColor = NSColor.controlAccentColor.cgColor
+                    portal.layer?.borderWidth = 1
+                }
+            }
+            self.showWorkItem = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+        } else {
+            self.cancelPendingShow()
+            if let popup = self.detailPopup, popup.isVisible, popup.frame.insetBy(dx: -8, dy: -8).contains(point) {
+                self.hideWorkItem?.cancel()
+                self.hideWorkItem = nil
+                return
+            }
+            guard self.detailPopup != nil, self.hideWorkItem == nil else { return }
+            let work = DispatchWorkItem { [weak self] in self?.hideDetails() }
+            self.hideWorkItem = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+        }
+    }
+
+    private func cancelPendingShow() {
+        self.showWorkItem?.cancel()
+        self.showWorkItem = nil
+        self.pendingModule = nil
+    }
+
+    private func hideDetails() {
+        self.cancelPendingShow()
+        self.hideWorkItem?.cancel()
+        self.hideWorkItem = nil
+        self.activeModule?.portal?.layer?.borderWidth = 0
+        self.activeModule = nil
+        let wasKey = self.detailPopup?.isKeyWindow == true
+        self.detailPopup?.setIsVisible(false)
+        self.detailPopup = nil
+        if wasKey, self.window?.isVisible == true { self.window?.makeKey() }
+    }
+
+    @objc private func close() {
+        self.window?.setIsVisible(false)
+    }
+    func setKeyboardShortcut(_ binding: [UInt16]) {
         self.keyboardShortcut = binding
         Store.shared.set(key: "CombinedModules_popup_keyboardShortcut", value: binding)
     }
     
     @objc private func reinit() {
+        self.hideDetails()
         self.subviews.forEach({ $0.removeFromSuperview() })
         
-        let availableModules = modules.filter({ $0.enabled && $0.portal != nil })
+        let availableModules = self.modules.filter({ $0.enabled && $0.portal != nil }).sorted { $0.combinedPosition < $1.combinedPosition }
+        self.displayedModules = availableModules
         var modulesHeight: CGFloat = 0
         availableModules.forEach { (m: Module) in
             if let p = m.portal {
